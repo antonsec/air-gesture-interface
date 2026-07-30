@@ -3,19 +3,14 @@ import mediapipe as mp
 import time
 
 
-# ----------------------------
 # Camera
-# ----------------------------
-
 cam = cv2.VideoCapture(0)
 
 cam.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
 
-# ----------------------------
-# MediaPipe Hands
-# ----------------------------
+# MediaPipe
 
 mp_hands = mp.solutions.hands
 
@@ -28,25 +23,21 @@ hands = mp_hands.Hands(
 mp_draw = mp.solutions.drawing_utils
 
 
-# ----------------------------
-# FPS
-# ----------------------------
+# Drawing canvas
+canvas = None
 
+
+# Previous finger position
+previous_points = {}
+
+
+# FPS
 previous_time = 0
 
 
-# ----------------------------
-# Smooth tracking storage
-# ----------------------------
-
-smooth_points = {}
-
-
-# ----------------------------
-# Main loop
-# ----------------------------
 
 while True:
+
 
     success, frame = cam.read()
 
@@ -54,11 +45,16 @@ while True:
         break
 
 
-    # Mirror camera
-    frame = cv2.flip(frame, 1)
+    frame = cv2.flip(frame,1)
 
 
-    # Convert for MediaPipe
+    # Create drawing layer once
+    if canvas is None:
+        canvas = frame.copy()
+        canvas[:] = 0
+
+
+
     rgb = cv2.cvtColor(
         frame,
         cv2.COLOR_BGR2RGB
@@ -68,9 +64,6 @@ while True:
     results = hands.process(rgb)
 
 
-    # ----------------------------
-    # Hand detection
-    # ----------------------------
 
     if results.multi_hand_landmarks:
 
@@ -78,7 +71,6 @@ while True:
         for hand_id, hand_landmarks in enumerate(results.multi_hand_landmarks):
 
 
-            # Draw skeleton
             mp_draw.draw_landmarks(
                 frame,
                 hand_landmarks,
@@ -86,114 +78,74 @@ while True:
             )
 
 
-            # Hand name
-            label = "Hand"
+            # Index finger tip
+            finger = hand_landmarks.landmark[8]
 
 
-            if results.multi_handedness:
-
-                label = results.multi_handedness[
-                    hand_id
-                ].classification[0].label
+            h,w,_ = frame.shape
 
 
-
-            # Index fingertip landmark
-            index = hand_landmarks.landmark[8]
-
-
-            h, w, _ = frame.shape
-
-
-            raw_x = int(index.x * w)
-            raw_y = int(index.y * h)
+            x = int(finger.x*w)
+            y = int(finger.y*h)
 
 
 
-            # ----------------------------
-            # Smooth movement
-            # ----------------------------
+            # Smooth point
 
-            if hand_id not in smooth_points:
+            if hand_id in previous_points:
 
-                smooth_points[hand_id] = (
-                    raw_x,
-                    raw_y
+                old_x, old_y = previous_points[hand_id]
+
+
+                cv2.line(
+                    canvas,
+                    (old_x,old_y),
+                    (x,y),
+                    (255,255,0),
+                    5
                 )
 
 
-            old_x, old_y = smooth_points[hand_id]
-
-
-            smooth_x = int(
-                old_x * 0.8 +
-                raw_x * 0.2
-            )
-
-
-            smooth_y = int(
-                old_y * 0.8 +
-                raw_y * 0.2
-            )
-
-
-            smooth_points[hand_id] = (
-                smooth_x,
-                smooth_y
-            )
+            previous_points[hand_id] = (x,y)
 
 
 
-            # ----------------------------
-            # Futuristic fingertip
-            # ----------------------------
+            # Finger glow
 
             cv2.circle(
                 frame,
-                (smooth_x, smooth_y),
+                (x,y),
                 15,
                 (255,255,0),
                 -1
             )
 
 
-            cv2.circle(
-                frame,
-                (smooth_x, smooth_y),
-                25,
-                (255,255,255),
-                2
-            )
 
+    # Combine drawing + camera
 
-            cv2.putText(
-                frame,
-                f"{label}  {smooth_x},{smooth_y}",
-                (smooth_x - 80, smooth_y - 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255,255,0),
-                2
-            )
-
-
-
-    # ----------------------------
-    # FPS
-    # ----------------------------
-
-    current_time = time.time()
-
-    fps = 1 / (
-        current_time - previous_time
+    frame = cv2.addWeighted(
+        frame,
+        0.7,
+        canvas,
+        0.8,
+        0
     )
 
-    previous_time = current_time
+
+
+    # FPS
+
+    current_time=time.time()
+
+    fps=1/(current_time-previous_time)
+
+    previous_time=current_time
 
 
     cv2.putText(
         frame,
-        f"FPS: {int(fps)}",
+        f"FPS {int(fps)}",
         (20,40),
         cv2.FONT_HERSHEY_SIMPLEX,
         1,
@@ -202,16 +154,23 @@ while True:
     )
 
 
-    # Display
-
     cv2.imshow(
-        "JARVIS HAND TRACKING",
+        "JARVIS AIR DRAW",
         frame
     )
 
 
-    if cv2.waitKey(1) == 27:
+    key=cv2.waitKey(1)
+
+
+    # ESC quit
+    if key==27:
         break
+
+
+    # C clears drawing
+    if key==ord("c"):
+        canvas[:] = 0
 
 
 
