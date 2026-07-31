@@ -1,426 +1,605 @@
+"""
+Hand Object Manipulator
+----------------------
+Real-time hand tracking object manipulation with MediaPipe + OpenCV.
+Supports grab, move, rotate, scale, throw, soft angle snap and basic physics.
+"""
+
 import cv2
 import mediapipe as mp
 import numpy as np
 import time
 import math
 import copy
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple, Dict
 
-# ==========================
-# CORE SETTINGS
-# ==========================
-CAM_W, CAM_H = 960, 540
-PINCH_THRES = 0.050
-MIN_SCALE, MAX_SCALE = 0.38, 2.7
 
-# Tracking quality
-BASE_SMOOTH = 0.42          # base cursor smoothing
-FAST_SMOOTH = 0.78          # when hand is moving fast
-SPEED_REF = 28.0            # px/frame where we switch to fast mode
-PRED_STRENGTH = 0.45        # how much we predict ahead while grabbing
-HOLD_FOLLOW = 0.93          # how tightly object sticks to hand (0.9–0.97)
+# ═══════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════════════════
 
-# Physics (kept light)
-FRICTION = 0.96
-ANGULAR_FRICTION = 0.93
-BOUNCE = 0.68
-GRAVITY = 0.32
-THROW_MULT = 1.25
-SPIN_MULT = 0.85
+@dataclass
+class Config:
+    # Camera
+    CAM_WIDTH: int = 800
+    CAM_HEIGHT: int = 450
 
-LOST_TOLERANCE = 8
-RELEASE_FRAMES = 3
+    # Tracking
+    PINCH_THRESHOLD: float = 0.050
+    BASE_SMOOTH: float = 0.40
+    FAST_SMOOTH: float = 0.75
+    SPEED_REF: float = 25.0
+    PREDICTION: float = 0.35
+    HOLD_FOLLOW: float = 0.94
 
-# ==========================
-# CAMERA
-# ==========================
-cam = cv2.VideoCapture(0)
-cam.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_W)
-cam.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
-cam.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-# cam.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    # Physics
+    FRICTION: float = 0.96
+    ANGULAR_FRICTION: float = 0.93
+    BOUNCE: float = 0.65
+    THROW_MULTIPLIER: float = 1.2
+    SPIN_MULTIPLIER: float = 0.8
 
-# ==========================
-# MEDIAPIPE
-# ==========================
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(
-    static_image_mode=False,
-    max_num_hands=2,
-    model_complexity=0,
-    min_detection_confidence=0.48,
-    min_tracking_confidence=0.48
-)
+    # Interaction
+    LOST_TOLERANCE: int = 8
+    RELEASE_FRAMES: int = 3
+    MIN_SCALE: float = 0.38
+    MAX_SCALE: float = 2.7
 
-# ==========================
-# OBJECTS
-# ==========================
-def make_obj(x, y, w, h, color, label):
-    return {
-        "x": float(x), "y": float(y), "w": float(w), "h": float(h),
-        "angle": 0.0, "vx": 0.0, "vy": 0.0, "va": 0.0,
-        "color": color, "label": label
-    }
+    # Soft angle snap
+    SNAP_ZONE: float = 14.0
+    SNAP_STRENGTH: float = 0.35
 
-objects = [
-    make_obj(180, 160, 170, 120, (0, 255, 255), "01"),
-    make_obj(520, 130, 150, 150, (255, 0, 220), "02"),
-    make_obj(350, 310, 190, 110, (0, 255, 170), "03"),
-]
-original = copy.deepcopy(objects)
 
-# ==========================
-# STATE
-# ==========================
-grabbed = None
-offset = (0.0, 0.0)
-base_left_pinch = None
-base_size = None
-smooth_scale = 1.0
+CFG = Config()
 
-# per-hand smooth state
-smooth = {}                 # "Right"/"Left" → {"pt": (x,y), "prev": (x,y), "vel": (vx,vy)}
-prev_angle = None
-lost_counter = 0
-open_counter = 0
-hover_id = None
 
-gravity_on = False
-physics_paused = False
+# ═══════════════════════════════════════════════════════════════
+# DATA STRUCTURES
+# ═══════════════════════════════════════════════════════════════
 
-# ==========================
-# HELPERS
-# ==========================
-def pinch_dist(hand):
-    t, i = hand.landmark[4], hand.landmark[8]
-    return math.hypot(t.x - i.x, t.y - i.y)
+@dataclass
+class Object2D:
+    x: float
+    y: float
+    w: float
+    h: float
+    color: Tuple[int, int, int]
+    label: str
+    angle: float = 0.0
+    vx: float = 0.0
+    vy: float = 0.0
+    va: float = 0.0
 
-def is_pinching(hand):
-    return pinch_dist(hand) < PINCH_THRES
+    @property
+    def center(self) -> Tuple[float, float]:
+        return self.x + self.w * 0.5, self.y + self.h * 0.5
 
-def hand_angle(hand):
-    w = hand.landmark[0]
-    m = hand.landmark[9]
-    return math.degrees(math.atan2(m.y - w.y, m.x - w.x))
+    def contains(self, px: float, py: float) -> bool:
+        return self.x <= px <= self.x + self.w and self.y <= py <= self.y + self.h
 
-def inside(px, py, obj):
-    return obj["x"] <= px <= obj["x"] + obj["w"] and obj["y"] <= py <= obj["y"] + obj["h"]
+    def reset_velocity(self):
+        self.vx = self.vy = self.va = 0.0
 
-def adaptive_smooth(prev, raw, prev_pt):
-    """Higher speed → less smoothing (more responsive)."""
+
+@dataclass
+class HandData:
+    index: Tuple[float, float]
+    thumb: Tuple[float, float]
+    velocity: Tuple[float, float]
+    is_pinching: bool
+    pinch_distance: float
+    angle: float
+
+
+# ═══════════════════════════════════════════════════════════════
+# UTILITY FUNCTIONS
+# ═══════════════════════════════════════════════════════════════
+
+def normalize_angle(angle: float) -> float:
+    return angle % 360.0
+
+
+def soft_snap(angle: float) -> float:
+    """Apply gentle magnetic pull toward 0° / 90° / 180° / 270°."""
+    a = normalize_angle(angle)
+    best_diff = None
+
+    for target in (0.0, 90.0, 180.0, 270.0):
+        diff = a - target
+        if diff > 180:
+            diff -= 360
+        if diff < -180:
+            diff += 360
+        if abs(diff) <= CFG.SNAP_ZONE:
+            if best_diff is None or abs(diff) < abs(best_diff):
+                best_diff = diff
+
+    if best_diff is not None:
+        proximity = 1.0 - (abs(best_diff) / CFG.SNAP_ZONE)
+        pull = best_diff * CFG.SNAP_STRENGTH * (0.4 + 0.6 * proximity)
+        return angle - pull
+    return angle
+
+
+def adaptive_smooth(
+    prev: Optional[Tuple[float, float]],
+    raw: Tuple[float, float],
+    prev_raw: Tuple[float, float]
+) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """Speed-adaptive exponential smoothing."""
     if prev is None:
         return raw, (0.0, 0.0)
-    dx = raw[0] - prev_pt[0]
-    dy = raw[1] - prev_pt[1]
+
+    dx = raw[0] - prev_raw[0]
+    dy = raw[1] - prev_raw[1]
     speed = math.hypot(dx, dy)
-    t = min(1.0, speed / SPEED_REF)
-    alpha = BASE_SMOOTH + (FAST_SMOOTH - BASE_SMOOTH) * t
-    sx = prev[0] * (1 - alpha) + raw[0] * alpha
-    sy = prev[1] * (1 - alpha) + raw[1] * alpha
-    return (sx, sy), (dx, dy)
+    t = min(1.0, speed / CFG.SPEED_REF)
+    alpha = CFG.BASE_SMOOTH + (CFG.FAST_SMOOTH - CFG.BASE_SMOOTH) * t
 
-def draw_obj(img, obj, active=False, hover=False):
-    x, y, w, h = obj["x"], obj["y"], obj["w"], obj["h"]
-    angle = obj["angle"]
-    col = obj["color"]
-    cx, cy = x + w * 0.5, y + h * 0.5
+    smoothed = (
+        prev[0] * (1 - alpha) + raw[0] * alpha,
+        prev[1] * (1 - alpha) + raw[1] * alpha
+    )
+    return smoothed, (dx, dy)
 
-    rad = math.radians(angle)
+
+def get_pinch_distance(hand_landmarks) -> float:
+    thumb = hand_landmarks.landmark[4]
+    index = hand_landmarks.landmark[8]
+    return math.hypot(thumb.x - index.x, thumb.y - index.y)
+
+
+def get_hand_angle(hand_landmarks) -> float:
+    wrist = hand_landmarks.landmark[0]
+    middle = hand_landmarks.landmark[9]
+    return math.degrees(math.atan2(middle.y - wrist.y, middle.x - wrist.x))
+
+
+# ═══════════════════════════════════════════════════════════════
+# PHYSICS
+# ═══════════════════════════════════════════════════════════════
+
+def update_physics(objects: List[Object2D], frame_w: int, frame_h: int, paused: bool):
+    if paused:
+        return
+
+    for obj in objects:
+        obj.vx *= CFG.FRICTION
+        obj.vy *= CFG.FRICTION
+        obj.va *= CFG.ANGULAR_FRICTION
+
+        obj.x += obj.vx
+        obj.y += obj.vy
+        obj.angle += obj.va
+
+        # Wall collisions
+        if obj.x < 0:
+            obj.x = 0
+            obj.vx *= -CFG.BOUNCE
+        if obj.y < 0:
+            obj.y = 0
+            obj.vy *= -CFG.BOUNCE
+        if obj.x + obj.w > frame_w:
+            obj.x = frame_w - obj.w
+            obj.vx *= -CFG.BOUNCE
+        if obj.y + obj.h > frame_h:
+            obj.y = frame_h - obj.h
+            obj.vy *= -CFG.BOUNCE
+
+    # Simple object-object separation
+    n = len(objects)
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = objects[i], objects[j]
+            if not (a.x < b.x + b.w and a.x + a.w > b.x and
+                    a.y < b.y + b.h and a.y + a.h > b.y):
+                continue
+
+            acx, acy = a.center
+            bcx, bcy = b.center
+            dx, dy = acx - bcx, acy - bcy
+            dist = math.hypot(dx, dy) or 1.0
+            overlap = 0.2 * (min(a.w, b.w) + min(a.h, b.h)) - dist
+
+            if overlap > 0:
+                nx, ny = dx / dist, dy / dist
+                push = overlap * 0.5
+                a.x += nx * push
+                a.y += ny * push
+                b.x -= nx * push
+                b.y -= ny * push
+
+
+# ═══════════════════════════════════════════════════════════════
+# RENDERING
+# ═══════════════════════════════════════════════════════════════
+
+def draw_object(img: np.ndarray, obj: Object2D, active: bool = False, hover: bool = False):
+    cx, cy = obj.center
+    rad = math.radians(obj.angle)
     c, s = math.cos(rad), math.sin(rad)
-    dx, dy = w * 0.5, h * 0.5
+    dx, dy = obj.w * 0.5, obj.h * 0.5
+
     corners = np.array([
-        [cx + (-dx*c - -dy*s), cy + (-dx*s + -dy*c)],
-        [cx + ( dx*c - -dy*s), cy + ( dx*s + -dy*c)],
-        [cx + ( dx*c -  dy*s), cy + ( dx*s +  dy*c)],
-        [cx + (-dx*c -  dy*s), cy + (-dx*s +  dy*c)],
+        [cx + (-dx * c - -dy * s), cy + (-dx * s + -dy * c)],
+        [cx + ( dx * c - -dy * s), cy + ( dx * s + -dy * c)],
+        [cx + ( dx * c -  dy * s), cy + ( dx * s +  dy * c)],
+        [cx + (-dx * c -  dy * s), cy + (-dx * s +  dy * c)],
     ], dtype=np.int32)
 
-    # cheap glow
-    for t, a in ((8, 0.13), (4, 0.22)):
-        over = img.copy()
-        cv2.polylines(over, [corners], True, col, t, cv2.LINE_AA)
-        cv2.addWeighted(over, a, img, 1 - a, 0, img)
+    # Glow (only when interacting)
+    if active or hover:
+        overlay = img.copy()
+        cv2.polylines(overlay, [corners], True, obj.color, 7, cv2.LINE_AA)
+        cv2.addWeighted(overlay, 0.18, img, 0.82, 0, img)
 
-    over = img.copy()
-    cv2.fillPoly(over, [corners], col)
-    intens = 0.23 if active else (0.15 if hover else 0.09)
-    cv2.addWeighted(over, intens, img, 1 - intens, 0, img)
-    cv2.polylines(img, [corners], True, col, 3 if active else 2, cv2.LINE_AA)
+    # Fill
+    overlay = img.copy()
+    cv2.fillPoly(overlay, [corners], obj.color)
+    intensity = 0.22 if active else (0.14 if hover else 0.08)
+    cv2.addWeighted(overlay, intensity, img, 1.0 - intensity, 0, img)
 
-    cv2.putText(img, obj["label"], (int(cx)-11, int(cy)+5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 1, cv2.LINE_AA)
+    # Border
+    thickness = 3 if active else 2
+    cv2.polylines(img, [corners], True, obj.color, thickness, cv2.LINE_AA)
 
-def physics_step(objs):
-    if physics_paused:
-        return
-    for o in objs:
-        if gravity_on:
-            o["vy"] += GRAVITY
-        o["vx"] *= FRICTION
-        o["vy"] *= FRICTION
-        o["va"] *= ANGULAR_FRICTION
-        o["x"] += o["vx"]
-        o["y"] += o["vy"]
-        o["angle"] += o["va"]
+    # Snap indicator
+    if active:
+        a = normalize_angle(obj.angle)
+        for target in (0, 90, 180, 270):
+            diff = min(abs(a - target), 360 - abs(a - target))
+            if diff <= CFG.SNAP_ZONE:
+                radius = int(16 + 10 * (1.0 - diff / CFG.SNAP_ZONE))
+                cv2.circle(img, (int(cx), int(cy)), radius, (255, 255, 255), 1, cv2.LINE_AA)
+                break
 
-        # walls
-        if o["x"] < 0:
-            o["x"] = 0
-            o["vx"] *= -BOUNCE
-        if o["y"] < 0:
-            o["y"] = 0
-            o["vy"] *= -BOUNCE
-        if o["x"] + o["w"] > CAM_W:
-            o["x"] = CAM_W - o["w"]
-            o["vx"] *= -BOUNCE
-        if o["y"] + o["h"] > CAM_H:
-            o["y"] = CAM_H - o["h"]
-            o["vy"] *= -BOUNCE
+    # Label
+    cv2.putText(img, obj.label, (int(cx) - 10, int(cy) + 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
-    # light pairwise separation
-    n = len(objs)
-    for i in range(n):
-        for j in range(i+1, n):
-            a, b = objs[i], objs[j]
-            if (a["x"] < b["x"]+b["w"] and a["x"]+a["w"] > b["x"] and
-                a["y"] < b["y"]+b["h"] and a["y"]+a["h"] > b["y"]):
-                acx = a["x"] + a["w"]*0.5
-                acy = a["y"] + a["h"]*0.5
-                bcx = b["x"] + b["w"]*0.5
-                bcy = b["y"] + b["h"]*0.5
-                dx, dy = acx - bcx, acy - bcy
-                dist = math.hypot(dx, dy) or 1.0
-                overlap = 0.22 * (min(a["w"], b["w"]) + min(a["h"], b["h"])) - dist
-                if overlap > 0:
-                    nx, ny = dx/dist, dy/dist
-                    push = overlap * 0.5
-                    a["x"] += nx * push
-                    a["y"] += ny * push
-                    b["x"] -= nx * push
-                    b["y"] -= ny * push
-                    a["vx"] -= (a["vx"]-b["vx"]) * 0.2
-                    a["vy"] -= (a["vy"]-b["vy"]) * 0.2
-                    b["vx"] += (a["vx"]-b["vx"]) * 0.2
-                    b["vy"] += (a["vy"]-b["vy"]) * 0.2
 
-# ==========================
-# MAIN LOOP
-# ==========================
-prev_time = time.perf_counter()
+def draw_hud(img: np.ndarray, status: str, fps: float, scale: float, angle: float, holding: bool):
+    h, w = img.shape[:2]
+    color = (0, 255, 190) if holding else (0, 200, 255)
 
-while True:
-    if not cam.grab():
-        break
-    ok, frame = cam.retrieve()
-    if not ok:
-        break
+    cv2.line(img, (0, 38), (w, 38), (0, 180, 255), 1)
+    cv2.putText(img, "OBJECT MANIPULATOR", (10, 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(img, f"{status}  {int(fps)} fps", (w - 175, 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1, cv2.LINE_AA)
 
-    frame = cv2.flip(frame, 1)
-    h, w = frame.shape[:2]
+    if holding:
+        cv2.putText(img, f"ZOOM {int(scale * 100)}%  ROT {int(angle % 360)}°",
+                    (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 200), 1, cv2.LINE_AA)
 
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    rgb.flags.writeable = False
-    results = hands.process(rgb)
-    rgb.flags.writeable = True
+    cv2.putText(img, "RIGHT: grab/move/rotate/throw   LEFT: zoom   SPACE=pause   R=reset   ESC=quit",
+                (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (140, 140, 170), 1, cv2.LINE_AA)
 
-    right = left = None
 
-    if results.multi_hand_landmarks and results.multi_handedness:
-        for hand_lms, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+# ═══════════════════════════════════════════════════════════════
+# HAND TRACKER
+# ═══════════════════════════════════════════════════════════════
+
+class HandTracker:
+    def __init__(self):
+        self.hands = mp.solutions.hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,
+            model_complexity=0,
+            min_detection_confidence=0.45,
+            min_tracking_confidence=0.45
+        )
+        self.smooth_state: Dict[str, dict] = {}
+
+    def process(self, frame: np.ndarray) -> Tuple[Optional[HandData], Optional[HandData]]:
+        h, w = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb.flags.writeable = False
+        results = self.hands.process(rgb)
+        rgb.flags.writeable = True
+
+        right = left = None
+
+        if not results.multi_hand_landmarks or not results.multi_handedness:
+            self.smooth_state.clear()
+            return None, None
+
+        for landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+            # Correct for mirrored image
             label = handedness.classification[0].label
-            label = "Right" if label == "Left" else "Left"   # mirror correction
+            label = "Right" if label == "Left" else "Left"
 
-            raw_idx = (hand_lms.landmark[8].x * w, hand_lms.landmark[8].y * h)
-            raw_thumb = (hand_lms.landmark[4].x * w, hand_lms.landmark[4].y * h)
+            raw_index = (landmarks.landmark[8].x * w, landmarks.landmark[8].y * h)
+            raw_thumb = (landmarks.landmark[4].x * w, landmarks.landmark[4].y * h)
 
-            if label not in smooth:
-                smooth[label] = {"pt": raw_idx, "prev": raw_idx, "vel": (0.0, 0.0),
-                                 "thumb": raw_thumb}
+            if label not in self.smooth_state:
+                self.smooth_state[label] = {
+                    "pt": raw_index,
+                    "prev": raw_index,
+                    "vel": (0.0, 0.0),
+                    "thumb": raw_thumb
+                }
             else:
-                st = smooth[label]
-                new_pt, vel = adaptive_smooth(st["pt"], raw_idx, st["prev"])
-                st["prev"] = st["pt"]
-                st["pt"] = new_pt
-                st["vel"] = vel
-                # light thumb smooth
-                st["thumb"] = (
-                    st["thumb"][0]*0.55 + raw_thumb[0]*0.45,
-                    st["thumb"][1]*0.55 + raw_thumb[1]*0.45
+                state = self.smooth_state[label]
+                new_pt, vel = adaptive_smooth(state["pt"], raw_index, state["prev"])
+                state["prev"] = state["pt"]
+                state["pt"] = new_pt
+                state["vel"] = vel
+                state["thumb"] = (
+                    state["thumb"][0] * 0.55 + raw_thumb[0] * 0.45,
+                    state["thumb"][1] * 0.55 + raw_thumb[1] * 0.45
                 )
 
-            data = {
-                "pt": smooth[label]["pt"],
-                "thumb": smooth[label]["thumb"],
-                "vel": smooth[label]["vel"],
-                "pinch": is_pinching(hand_lms),
-                "pinch_d": pinch_dist(hand_lms),
-                "angle": hand_angle(hand_lms)
-            }
+            state = self.smooth_state[label]
+            data = HandData(
+                index=state["pt"],
+                thumb=state["thumb"],
+                velocity=state["vel"],
+                is_pinching=get_pinch_distance(landmarks) < CFG.PINCH_THRESHOLD,
+                pinch_distance=get_pinch_distance(landmarks),
+                angle=get_hand_angle(landmarks)
+            )
 
             if label == "Right":
                 right = data
             else:
                 left = data
 
-            # dots
-            col = (0, 255, 200) if data["pinch"] else (200, 80, 255)
-            cx, cy = int(data["pt"][0]), int(data["pt"][1])
-            tx, ty = int(data["thumb"][0]), int(data["thumb"][1])
-            cv2.circle(frame, (cx, cy), 7, col, -1, cv2.LINE_AA)
-            cv2.circle(frame, (tx, ty), 5, (255, 255, 255), -1, cv2.LINE_AA)
-            cv2.circle(frame, (cx, cy), 11, (255, 255, 255), 1, cv2.LINE_AA)
-    else:
-        smooth.clear()
+        return right, left
 
-    # -------------------- INTERACTION --------------------
-    hover_id = None
+    def draw_cursors(self, frame: np.ndarray, right: Optional[HandData], left: Optional[HandData]):
+        for hand in (right, left):
+            if hand is None:
+                continue
+            color = (0, 255, 200) if hand.is_pinching else (200, 80, 255)
+            cx, cy = int(hand.index[0]), int(hand.index[1])
+            tx, ty = int(hand.thumb[0]), int(hand.thumb[1])
+            cv2.circle(frame, (cx, cy), 6, color, -1, cv2.LINE_AA)
+            cv2.circle(frame, (tx, ty), 4, (255, 255, 255), -1, cv2.LINE_AA)
 
-    if right is not None:
-        lost_counter = 0
-        px, py = right["pt"]
-        vx, vy = right["vel"]
+    def close(self):
+        self.hands.close()
 
-        if grabbed is None:
-            for i, obj in enumerate(objects):
-                if inside(px, py, obj):
-                    hover_id = i
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN APPLICATION
+# ═══════════════════════════════════════════════════════════════
+
+class ObjectManipulator:
+    def __init__(self):
+        self.cam = cv2.VideoCapture(0)
+        self.cam.set(cv2.CAP_PROP_FRAME_WIDTH, CFG.CAM_WIDTH)
+        self.cam.set(cv2.CAP_PROP_FRAME_HEIGHT, CFG.CAM_HEIGHT)
+        self.cam.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        self.tracker = HandTracker()
+
+        self.objects: List[Object2D] = [
+            Object2D(150, 140, 160, 110, (0, 255, 255), "01"),
+            Object2D(420, 120, 140, 140, (255, 0, 220), "02"),
+            Object2D(280, 260, 170, 100, (0, 255, 170), "03"),
+        ]
+        self.original_objects = copy.deepcopy(self.objects)
+
+        # Interaction state
+        self.grabbed_idx: Optional[int] = None
+        self.offset = (0.0, 0.0)
+        self.base_left_pinch: Optional[float] = None
+        self.base_size: Optional[Tuple[float, float]] = None
+        self.smooth_scale = 1.0
+        self.prev_angle: Optional[float] = None
+        self.lost_counter = 0
+        self.open_counter = 0
+        self.hover_idx: Optional[int] = None
+        self.physics_paused = False
+
+        self.prev_time = time.perf_counter()
+
+    def _start_grab(self, idx: int, hand: HandData, left: Optional[HandData]):
+        obj = self.objects[idx]
+        self.grabbed_idx = idx
+        self.offset = (hand.index[0] - obj.x, hand.index[1] - obj.y)
+        self.base_size = (obj.w, obj.h)
+        self.smooth_scale = 1.0
+        self.base_left_pinch = left.pinch_distance if left else None
+        self.open_counter = 0
+        self.prev_angle = hand.angle
+        obj.reset_velocity()
+
+        # Bring to front
+        self.objects.append(self.objects.pop(idx))
+        self.grabbed_idx = len(self.objects) - 1
+
+    def _release(self, hand: HandData):
+        obj = self.objects[self.grabbed_idx]
+        px, py = hand.index
+        vx, vy = hand.velocity
+
+        obj.x = px - self.offset[0]
+        obj.y = py - self.offset[1]
+        obj.angle = soft_snap(obj.angle)
+        obj.vx = vx * CFG.THROW_MULTIPLIER
+        obj.vy = vy * CFG.THROW_MULTIPLIER
+
+        if self.prev_angle is not None:
+            delta = hand.angle - self.prev_angle
+            if delta > 180:
+                delta -= 360
+            if delta < -180:
+                delta += 360
+            obj.va = delta * CFG.SPIN_MULTIPLIER
+
+        self.grabbed_idx = None
+        self.base_left_pinch = None
+        self.base_size = None
+        self.prev_angle = None
+        self.open_counter = 0
+
+    def _update_held_object(self, hand: HandData, left: Optional[HandData]):
+        obj = self.objects[self.grabbed_idx]
+        px, py = hand.index
+        vx, vy = hand.velocity
+
+        # Predictive tight follow
+        pred_x = px + vx * CFG.PREDICTION
+        pred_y = py + vy * CFG.PREDICTION
+        target_x = pred_x - self.offset[0]
+        target_y = pred_y - self.offset[1]
+
+        obj.x = obj.x * (1 - CFG.HOLD_FOLLOW) + target_x * CFG.HOLD_FOLLOW
+        obj.y = obj.y * (1 - CFG.HOLD_FOLLOW) + target_y * CFG.HOLD_FOLLOW
+        obj.reset_velocity()
+
+        # Rotation + soft snap
+        if self.prev_angle is not None:
+            delta = hand.angle - self.prev_angle
+            if delta > 180:
+                delta -= 360
+            if delta < -180:
+                delta += 360
+            obj.angle = soft_snap(obj.angle + delta * 0.96)
+        self.prev_angle = hand.angle
+
+        # Left-hand zoom
+        if left is not None:
+            if self.base_left_pinch is None or self.base_left_pinch < 0.015:
+                self.base_left_pinch = max(left.pinch_distance, 0.02)
+                self.base_size = (obj.w, obj.h)
+                self.smooth_scale = 1.0
+            else:
+                target = left.pinch_distance / self.base_left_pinch
+                target = max(CFG.MIN_SCALE, min(CFG.MAX_SCALE, target))
+                self.smooth_scale = self.smooth_scale * 0.8 + target * 0.2
+
+                new_w = self.base_size[0] * self.smooth_scale
+                new_h = self.base_size[1] * self.smooth_scale
+                cx, cy = obj.center
+                obj.w, obj.h = new_w, new_h
+                obj.x = cx - new_w * 0.5
+                obj.y = cy - new_h * 0.5
+        else:
+            self.base_left_pinch = None
+            self.base_size = (obj.w, obj.h)
+            self.smooth_scale = 1.0
+
+    def handle_interaction(self, right: Optional[HandData], left: Optional[HandData]):
+        self.hover_idx = None
+
+        if right is None:
+            if self.grabbed_idx is not None:
+                self.lost_counter += 1
+                if self.lost_counter > CFG.LOST_TOLERANCE:
+                    self.objects[self.grabbed_idx].angle = soft_snap(
+                        self.objects[self.grabbed_idx].angle
+                    )
+                    self.grabbed_idx = None
+                    self.base_left_pinch = None
+                    self.base_size = None
+                    self.prev_angle = None
+                    self.open_counter = 0
+            return
+
+        self.lost_counter = 0
+        px, py = right.index
+
+        if self.grabbed_idx is None:
+            # Hover + grab
+            for i, obj in enumerate(self.objects):
+                if obj.contains(px, py):
+                    self.hover_idx = i
                     break
 
-            if right["pinch"] and hover_id is not None:
-                grabbed = hover_id
-                offset = (px - objects[grabbed]["x"], py - objects[grabbed]["y"])
-                base_size = (objects[grabbed]["w"], objects[grabbed]["h"])
-                smooth_scale = 1.0
-                base_left_pinch = left["pinch_d"] if left else None
-                open_counter = 0
-                prev_angle = right["angle"]
-                objects[grabbed]["vx"] = objects[grabbed]["vy"] = objects[grabbed]["va"] = 0.0
-                # bring to front
-                objects.append(objects.pop(grabbed))
-                grabbed = len(objects) - 1
+            if right.is_pinching and self.hover_idx is not None:
+                self._start_grab(self.hover_idx, right, left)
         else:
-            obj = objects[grabbed]
-
-            if right["pinch"]:
-                open_counter = 0
+            # Currently holding
+            if right.is_pinching:
+                self.open_counter = 0
             else:
-                open_counter += 1
+                self.open_counter += 1
 
-            if open_counter >= RELEASE_FRAMES:
-                # clean throw
-                obj["x"] = px - offset[0]
-                obj["y"] = py - offset[1]
-                obj["vx"] = vx * THROW_MULT
-                obj["vy"] = vy * THROW_MULT
-                if prev_angle is not None:
-                    d = right["angle"] - prev_angle
-                    if d > 180: d -= 360
-                    if d < -180: d += 360
-                    obj["va"] = d * SPIN_MULT
-                grabbed = None
-                base_left_pinch = base_size = prev_angle = None
-                open_counter = 0
+            if self.open_counter >= CFG.RELEASE_FRAMES:
+                self._release(right)
             else:
-                # ===== HIGH RESPONSIVENESS HOLD =====
-                # predict slightly ahead
-                pred_x = px + vx * PRED_STRENGTH
-                pred_y = py + vy * PRED_STRENGTH
-                target_x = pred_x - offset[0]
-                target_y = pred_y - offset[1]
+                self._update_held_object(right, left)
 
-                obj["x"] = obj["x"] * (1 - HOLD_FOLLOW) + target_x * HOLD_FOLLOW
-                obj["y"] = obj["y"] * (1 - HOLD_FOLLOW) + target_y * HOLD_FOLLOW
-                obj["vx"] = obj["vy"] = obj["va"] = 0.0
+    def run(self):
+        while True:
+            if not self.cam.grab():
+                break
+            ok, frame = self.cam.retrieve()
+            if not ok:
+                break
 
-                # rotation – direct and clean
-                if prev_angle is not None:
-                    d = right["angle"] - prev_angle
-                    if d > 180: d -= 360
-                    if d < -180: d += 360
-                    obj["angle"] += d * 0.97
-                prev_angle = right["angle"]
+            frame = cv2.flip(frame, 1)
+            h, w = frame.shape[:2]
 
-                # left hand zoom
-                if left is not None:
-                    if base_left_pinch is None or base_left_pinch < 0.015:
-                        base_left_pinch = max(left["pinch_d"], 0.02)
-                        base_size = (obj["w"], obj["h"])
-                        smooth_scale = 1.0
-                    else:
-                        target = max(MIN_SCALE, min(MAX_SCALE, left["pinch_d"] / base_left_pinch))
-                        smooth_scale = smooth_scale * 0.82 + target * 0.18
-                        nw = base_size[0] * smooth_scale
-                        nh = base_size[1] * smooth_scale
-                        cx = obj["x"] + obj["w"] * 0.5
-                        cy = obj["y"] + obj["h"] * 0.5
-                        obj["w"], obj["h"] = nw, nh
-                        obj["x"] = cx - nw * 0.5
-                        obj["y"] = cy - nh * 0.5
-                else:
-                    base_left_pinch = None
-                    base_size = (obj["w"], obj["h"])
-                    smooth_scale = 1.0
+            # Tracking
+            right, left = self.tracker.process(frame)
+            self.tracker.draw_cursors(frame, right, left)
 
-                # link line
-                ocx = int(obj["x"] + obj["w"]*0.5)
-                ocy = int(obj["y"] + obj["h"]*0.5)
-                cv2.line(frame, (int(px), int(py)), (ocx, ocy), (0, 255, 220), 1, cv2.LINE_AA)
-    else:
-        if grabbed is not None:
-            lost_counter += 1
-            if lost_counter > LOST_TOLERANCE:
-                objects[grabbed]["vx"] = objects[grabbed].get("last_vx", 0) * 0.5
-                objects[grabbed]["vy"] = objects[grabbed].get("last_vy", 0) * 0.5
-                grabbed = None
-                base_left_pinch = base_size = prev_angle = None
-                open_counter = 0
+            # Interaction
+            self.handle_interaction(right, left)
 
-    physics_step(objects)
+            # Physics
+            update_physics(self.objects, w, h, self.physics_paused)
 
-    # -------------------- DRAW --------------------
-    frame = cv2.addWeighted(frame, 0.85, np.zeros_like(frame), 0.15, 0)
+            # Render
+            frame = cv2.addWeighted(frame, 0.87, np.zeros_like(frame), 0.13, 0)
 
-    for i, obj in enumerate(objects):
-        draw_obj(frame, obj, active=(i == grabbed), hover=(i == hover_id))
+            for i, obj in enumerate(self.objects):
+                draw_object(
+                    frame, obj,
+                    active=(i == self.grabbed_idx),
+                    hover=(i == self.hover_idx)
+                )
 
-    # HUD
-    now = time.perf_counter()
-    fps = 1.0 / max(now - prev_time, 1e-6)
-    prev_time = now
+            # Connection line while holding
+            if self.grabbed_idx is not None and right is not None:
+                obj = self.objects[self.grabbed_idx]
+                cx, cy = obj.center
+                cv2.line(frame,
+                         (int(right.index[0]), int(right.index[1])),
+                         (int(cx), int(cy)),
+                         (0, 255, 220), 1, cv2.LINE_AA)
 
-    cv2.line(frame, (0, 42), (w, 42), (0, 180, 255), 1)
-    status = "HOLDING" if grabbed is not None else "READY"
-    col = (0, 255, 190) if grabbed is not None else (0, 200, 255)
-    mode = "PHYS PAUSED" if physics_paused else ("GRAVITY" if gravity_on else "ZERO-G")
+            # HUD
+            now = time.perf_counter()
+            fps = 1.0 / max(now - self.prev_time, 1e-6)
+            self.prev_time = now
 
-    cv2.putText(frame, "RESPONSIVE MANIPULATOR", (12, 28),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 255, 255), 1, cv2.LINE_AA)
-    cv2.putText(frame, f"{status}  {int(fps)} fps", (w-190, 28),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.52, col, 1, cv2.LINE_AA)
-    cv2.putText(frame, mode, (12, 68),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 200), 1, cv2.LINE_AA)
+            status = "HOLDING" if self.grabbed_idx is not None else "READY"
+            angle = self.objects[self.grabbed_idx].angle if self.grabbed_idx is not None else 0
+            draw_hud(frame, status, fps, self.smooth_scale, angle, self.grabbed_idx is not None)
 
-    if grabbed is not None:
-        cv2.putText(frame, f"ZOOM {int(smooth_scale*100)}%   ROT {int(objects[grabbed]['angle']%360)}°",
-                    (12, 94), cv2.FONT_HERSHEY_SIMPLEX, 0.47, (0, 255, 200), 1, cv2.LINE_AA)
+            cv2.imshow("OBJECT MANIPULATOR", frame)
 
-    cv2.putText(frame, "RIGHT: grab / move / rotate / throw    LEFT: zoom    G=gravity  SPACE=pause  R=reset  ESC=quit",
-                (12, h-12), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (140, 140, 170), 1, cv2.LINE_AA)
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:                       # ESC
+                break
+            if key in (ord("r"), ord("R")):     # Reset
+                self.objects = copy.deepcopy(self.original_objects)
+                self.grabbed_idx = None
+                self.base_left_pinch = None
+                self.base_size = None
+                self.prev_angle = None
+                self.smooth_scale = 1.0
+            if key == 32:                       # Space – pause physics
+                self.physics_paused = not self.physics_paused
 
-    cv2.imshow("RESPONSIVE MANIPULATOR", frame)
+        self.cleanup()
 
-    key = cv2.waitKey(1) & 0xFF
-    if key == 27:
-        break
-    if key in (ord("r"), ord("R")):
-        objects = copy.deepcopy(original)
-        grabbed = None
-        base_left_pinch = base_size = prev_angle = None
-        smooth_scale = 1.0
-    if key in (ord("g"), ord("G")):
-        gravity_on = not gravity_on
-    if key == 32:
-        physics_paused = not physics_paused
+    def cleanup(self):
+        self.cam.release()
+        self.tracker.close()
+        cv2.destroyAllWindows()
 
-cam.release()
-hands.close()
-cv2.destroyAllWindows()
+
+# ═══════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ═══════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    app = ObjectManipulator()
+    app.run()

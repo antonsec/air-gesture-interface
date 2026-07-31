@@ -1,16 +1,25 @@
 # Hand Object Manipulator
 
-Real-time hand tracking object manipulation using MediaPipe + OpenCV.
+Real-time hand-tracking object manipulation built with **MediaPipe** + **OpenCV**.
 
-Grab, move, rotate, scale, and throw virtual objects with your hands. Includes basic physics (velocity, friction, wall bouncing, gravity).
+Grab, move, rotate, scale and throw virtual objects using your hands. Includes soft angle snapping and lightweight physics.
+
+---
 
 ## Features
 
-- **Right hand**: Pinch to grab & move, twist to rotate, fling to throw
-- **Left hand**: Pinch in/out to scale/zoom the grabbed object
-- Physics: momentum, friction, wall bounce, optional gravity
-- Smooth adaptive tracking + predictive follow
-- Clean neon-style visuals
+- **Right hand**
+  - Pinch → grab & move
+  - Twist hand → rotate object
+  - Fling + release → throw with momentum
+- **Left hand**
+  - Pinch in/out → scale / zoom object
+- Soft magnetic snap to 0° / 90° / 180° / 270°
+- Basic physics (velocity, friction, wall bounce)
+- Adaptive smoothing + predictive tracking
+- Clean modular codebase
+
+---
 
 ## Requirements
 
