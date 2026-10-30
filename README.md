@@ -27,4 +27,4 @@ Grab, move, rotate, scale and throw virtual objects using your hands. Includes s
 - Webcam
 
 ```bash
-pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
