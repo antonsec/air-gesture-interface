@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 import math
 import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict
 
 
@@ -28,12 +28,12 @@ class Config:
     CAM_HEIGHT: int = 600
 
     # Tracking
-    PINCH_THRESHOLD: float = 0.050  # retained for reference
-    PINCH_CLOSE_RATIO: float = 0.48  # tip gap / palm size to start a pinch
-    PINCH_OPEN_RATIO: float = 0.70   # larger threshold prevents flicker
+    TRACKING_WIDTH: int = 640  # inference only; display keeps its resolution
+    PINCH_CLOSE_RATIO: float = 0.25  # tip gap / palm size to start a pinch
+    PINCH_OPEN_RATIO: float = 0.40   # larger threshold prevents flicker
     GRAB_PADDING: float = 18.0      # pixels outside visible object
-    BASE_SMOOTH: float = 0.40
-    FAST_SMOOTH: float = 0.75
+    BASE_SMOOTH: float = 0.60
+    FAST_SMOOTH: float = 0.85
     SPEED_REF: float = 25.0
     PREDICTION: float = 0.35
     HOLD_FOLLOW: float = 0.94
@@ -376,7 +376,14 @@ class HandTracker:
 
     def process(self, frame: np.ndarray) -> Tuple[Optional[HandData], Optional[HandData]]:
         h, w = frame.shape[:2]
-        rgb = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        # Keep display quality separate from the cost of synchronous inference.
+        tracking_frame = frame
+        if w > CFG.TRACKING_WIDTH:
+            tracking_frame = cv2.resize(
+                frame, (CFG.TRACKING_WIDTH, max(1, round(h * CFG.TRACKING_WIDTH / w))),
+                interpolation=cv2.INTER_AREA,
+            )
+        rgb = np.ascontiguousarray(cv2.cvtColor(tracking_frame, cv2.COLOR_BGR2RGB))
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
         # VIDEO mode requires strictly increasing timestamps, in milliseconds.
@@ -389,6 +396,7 @@ class HandTracker:
             self.smooth_state.clear()
             return None, None
 
+        seen = set()
         for landmarks, handedness in zip(results.hand_landmarks, results.handedness):
             if not handedness:
                 continue
@@ -399,6 +407,9 @@ class HandTracker:
                 continue
             label = "Right" if detected_label == "Left" else "Left"
 
+            if label in seen:
+                continue
+            seen.add(label)
             raw_index = (landmarks[8].x * w, landmarks[8].y * h)
             raw_thumb = (landmarks[4].x * w, landmarks[4].y * h)
             if label not in self.smooth_state:
@@ -407,17 +418,27 @@ class HandTracker:
                     "prev": raw_index,
                     "vel": (0.0, 0.0),
                     "thumb": raw_thumb,
+                    "prev_thumb": raw_thumb,
                     "pinching": False,
                 }
             else:
                 state = self.smooth_state[label]
-                new_pt, vel = adaptive_smooth(state["pt"], raw_index, state["prev"])
-                state["prev"] = state["pt"]
+                new_pt, _ = adaptive_smooth(state["pt"], raw_index, state["prev"])
+                previous_midpoint = (
+                    (state["pt"][0] + state["thumb"][0]) * 0.5,
+                    (state["pt"][1] + state["thumb"][1]) * 0.5,
+                )
+                state["prev"] = raw_index
                 state["pt"] = new_pt
-                state["vel"] = vel
-                state["thumb"] = (
-                    state["thumb"][0] * 0.55 + raw_thumb[0] * 0.45,
-                    state["thumb"][1] * 0.55 + raw_thumb[1] * 0.45,
+                # Throw and prediction follow the same visible grab midpoint.
+                state["thumb"], _ = adaptive_smooth(
+                    state["thumb"], raw_thumb, state["prev_thumb"]
+                )
+                state["prev_thumb"] = raw_thumb
+
+                state["vel"] = (
+                    (new_pt[0] + state["thumb"][0]) * 0.5 - previous_midpoint[0],
+                    (new_pt[1] + state["thumb"][1]) * 0.5 - previous_midpoint[1],
                 )
 
             state = self.smooth_state[label]
@@ -448,6 +469,10 @@ class HandTracker:
                 right = data
             else:
                 left = data
+        # A returning hand starts a fresh filter rather than inheriting a
+        # stale position, pinch latch, or throw velocity.
+        self.smooth_state = {key: value for key, value in self.smooth_state.items()
+                             if key in seen}
         return right, left
 
     def draw_cursors(self, frame: np.ndarray, right: Optional[HandData], left: Optional[HandData]):
@@ -494,7 +519,12 @@ class ObjectManipulator:
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
         self.resize_display()
 
-        self.tracker = HandTracker()
+        try:
+            self.tracker = HandTracker()
+        except Exception:
+            self.cam.release()
+            cv2.destroyAllWindows()
+            raise
 
         self.objects: List[Object2D] = [
             Object2D(155, 175, 132, 92, (75, 227, 255), "01"),
@@ -507,7 +537,7 @@ class ObjectManipulator:
         self.grabbed_idx: Optional[int] = None
         self.grab_hand: Optional[str] = None
         self.offset = (0.0, 0.0)
-        self.base_left_pinch: Optional[float] = None
+        self.base_other_pinch: Optional[float] = None
         self.base_size: Optional[Tuple[float, float]] = None
         self.smooth_scale = 1.0
         self.prev_angle: Optional[float] = None
@@ -531,8 +561,9 @@ class ObjectManipulator:
         self.offset = (hand.pinch_point[0] - obj.x, hand.pinch_point[1] - obj.y)
         self.base_size = (obj.w, obj.h)
         self.smooth_scale = 1.0
-        self.base_left_pinch = left.pinch_distance if left else None
+        self.base_other_pinch = left.pinch_distance if left else None
         self.open_counter = 0
+        self.lost_counter = 0
         self.prev_angle = hand.angle
         obj.reset_velocity()
 
@@ -561,7 +592,7 @@ class ObjectManipulator:
 
         self.grabbed_idx = None
         self.grab_hand = None
-        self.base_left_pinch = None
+        self.base_other_pinch = None
         self.base_size = None
         self.prev_angle = None
         self.open_counter = 0
@@ -591,25 +622,29 @@ class ObjectManipulator:
             obj.angle = soft_snap(obj.angle + delta * 0.96)
         self.prev_angle = hand.angle
 
-        # Left-hand zoom
+        # Opposite-hand zoom
         if left is not None:
-            if self.base_left_pinch is None or self.base_left_pinch < 0.015:
-                self.base_left_pinch = max(left.pinch_distance, 0.02)
+            if self.base_other_pinch is None or self.base_other_pinch < 0.015:
+                self.base_other_pinch = max(left.pinch_distance, 0.02)
                 self.base_size = (obj.w, obj.h)
                 self.smooth_scale = 1.0
             else:
-                target = left.pinch_distance / self.base_left_pinch
+                target = left.pinch_distance / self.base_other_pinch
                 target = max(CFG.MIN_SCALE, min(CFG.MAX_SCALE, target))
                 self.smooth_scale = self.smooth_scale * 0.8 + target * 0.2
 
                 new_w = self.base_size[0] * self.smooth_scale
                 new_h = self.base_size[1] * self.smooth_scale
                 cx, cy = obj.center
+                dw, dh = new_w - obj.w, new_h - obj.h
                 obj.w, obj.h = new_w, new_h
                 obj.x = cx - new_w * 0.5
                 obj.y = cy - new_h * 0.5
+                # Keep the next follow update anchored to the resized object.
+                self.offset = (self.offset[0] + dw * 0.5,
+                               self.offset[1] + dh * 0.5)
         else:
-            self.base_left_pinch = None
+            self.base_other_pinch = None
             self.base_size = (obj.w, obj.h)
             self.smooth_scale = 1.0
 
@@ -665,7 +700,7 @@ class ObjectManipulator:
     def _clear_grab(self):
         self.grabbed_idx = None
         self.grab_hand = None
-        self.base_left_pinch = None
+        self.base_other_pinch = None
         self.base_size = None
         self.prev_angle = None
         self.open_counter = 0
@@ -673,6 +708,12 @@ class ObjectManipulator:
         self.smooth_scale = 1.0
 
     def run(self):
+        try:
+            self._run_loop()
+        finally:
+            self.cleanup()
+
+    def _run_loop(self):
         while True:
             if not self.cam.grab():
                 break
@@ -693,8 +734,6 @@ class ObjectManipulator:
             update_physics(self.objects, w, h, self.physics_paused, self.grabbed_idx)
 
             # Render
-            frame = cv2.addWeighted(frame, 0.87, np.zeros_like(frame), 0.13, 0)
-
             for i, obj in enumerate(self.objects):
                 draw_object(
                     frame, obj,
@@ -731,12 +770,7 @@ class ObjectManipulator:
                 break
             if key in (ord("r"), ord("R")):     # Reset
                 self.objects = copy.deepcopy(self.original_objects)
-                self.grabbed_idx = None
-                self.grab_hand = None
-                self.base_left_pinch = None
-                self.base_size = None
-                self.prev_angle = None
-                self.smooth_scale = 1.0
+                self._clear_grab()
             if key == 32:                       # Space – pause physics
                 self.physics_paused = not self.physics_paused
             if key in (ord("-"), ord("_")):
@@ -745,8 +779,6 @@ class ObjectManipulator:
             if key in (ord("+"), ord("=")):
                 self.window_scale = min(1.4, round(self.window_scale + 0.1, 2))
                 self.resize_display()
-
-        self.cleanup()
 
     def cleanup(self):
         self.cam.release()

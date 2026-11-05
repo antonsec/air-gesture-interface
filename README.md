@@ -77,6 +77,9 @@ The webcam image is mirrored to make interactions feel natural. The complete inc
 
 If the camera itself seems zoomed in, check the webcam's own auto-framing settings (for example, macOS Center Stage) and disable them. The app cannot recover parts of the scene that the camera or operating system has already cropped.
 
+The camera feed is displayed at its original brightness. Tracking uses a smaller
+640-pixel-wide copy of the canvas; the displayed camera image stays at 960 × 600.
+
 ## Gesture tuning
 
 The `Config` class in `main.py` contains useful thresholds:
@@ -85,6 +88,7 @@ The `Config` class in `main.py` contains useful thresholds:
 | --- | --- |
 | `PINCH_CLOSE_RATIO` | Maximum hand-relative fingertip gap for starting a pinch |
 | `PINCH_OPEN_RATIO` | Larger release threshold to avoid rapid grab/release flicker |
+| `TRACKING_WIDTH` | Inference image width; increase if small hands are hard to detect |
 | `GRAB_PADDING` | Extra pixels around an object's rotated shape for easier selection |
 | `RELEASE_FRAMES` | Consecutive open-hand frames before release |
 | `LOST_TOLERANCE` | Frames to tolerate temporary hand-tracking loss |
@@ -126,6 +130,28 @@ air-gesture-interface/
 └── models/
     └── hand_landmarker.task  # Download separately; not tracked in Git
 ```
+
+## Validation
+
+Run the camera-free regression suite and dependency checks in the virtual environment:
+
+```bash
+python -m unittest discover -s tests -v
+python -m py_compile main.py
+python -m pip check
+git diff --check
+```
+
+The tests cover either-hand ownership, opposite-hand resizing, release debounce,
+tracking loss, smoothing history, timestamps, and aspect-ratio fitting. They do
+not verify real webcam recognition or physical hand labels. Before merging, test
+both hands individually, crossing hands, temporary occlusion, resize, release,
+throw, reset, and window resizing on your Mac. Physics uses per-frame steps, so
+throw speed and friction currently vary with tracking frame rate.
+
+The audited local environment uses Python 3.9.6, MediaPipe 1.1.1,
+OpenCV contrib 5.0.0.93, and NumPy 2.0.2. Only the contrib OpenCV distribution
+should be installed; avoid installing `opencv-python` alongside it.
 
 ## Status
 
