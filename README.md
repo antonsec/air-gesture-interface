@@ -1,3 +1,7 @@
+## Demo
+
+![Air Gesture Interface demo](docs/demo.gif)
+
 # Air Gesture Interface
 
 A real-time **hand-controlled object playground** built with Python, [MediaPipe Hand Landmarker](https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker/python), and OpenCV. Use a webcam to pick up, move, rotate, resize, and throw virtual objects—no mouse required.
