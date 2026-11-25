@@ -69,11 +69,13 @@ The `.venv/` directory and downloaded `.task` model are local files and should *
 | Change the **other** hand's thumb–index distance | Resize the object |
 | Move quickly and release the grabbing hand's pinch | Throw the object |
 | `R` | Reset object positions and sizes |
+| `C` | Start open-hand calibration, then capture a pinch when prompted |
+| `X` | Cancel calibration and restore default pinch thresholds for both hands |
 | `Space` | Pause / resume physics |
 | `-` / `+` (or `=`) | Shrink / enlarge the display window |
 | `Esc` | Exit |
 
-The grab point is **between your thumb and index fingertips**, rather than at your index fingertip alone. Look for `L PINCH` or `R PINCH` near the hand cursor to confirm that a pinch is recognized. `OPEN` means the hand is tracked but the pinch isn't active. The hand that begins a grab keeps control of that object until release or tracking loss.
+The grab point is **between your thumb and index fingertips**, rather than at your index fingertip alone. Look for `L PINCH` or `R PINCH` near the hand cursor to confirm that a pinch is recognized. `OPEN` means the hand is tracked but the pinch isn't active. The hand that begins a grab keeps control of that object until release or sustained tracking loss. Brief tracking gaps freeze the held object for up to 0.30 seconds. A returning hand re-anchors without moving the object on the recovery frame. The HUD shows `HAND LOST` during a gap.
 
 ## Camera and display
 
@@ -83,6 +85,20 @@ If the camera itself seems zoomed in, check the webcam's own auto-framing settin
 
 The camera feed is displayed at its original brightness. Tracking uses a smaller
 640-pixel-wide copy of the canvas; the displayed camera image stays at 960 × 600.
+
+## Pinch calibration
+
+Calibration is optional and applies separately to each hand for the current session.
+
+1. Show only one hand with thumb and index comfortably apart, then press `C`.
+2. Keep that pose for about a second until the on-screen prompt changes.
+3. Touch thumb and index together, press `C` again, and hold for about a second.
+4. Repeat with the other hand if needed. Press `X` to cancel or restore defaults.
+
+The app freezes physics and object interaction during calibration. If the hand
+is missing for too long, calibration times out. Similar poses and wide pinches
+are rejected while any previous valid thresholds are kept. Calibration resets
+when the application exits.
 
 ## Gesture tuning
 
@@ -94,8 +110,8 @@ The `Config` class in `main.py` contains useful thresholds:
 | `PINCH_OPEN_RATIO` | Larger release threshold to avoid rapid grab/release flicker |
 | `TRACKING_WIDTH` | Inference image width; increase if small hands are hard to detect |
 | `GRAB_PADDING` | Extra pixels around an object's rotated shape for easier selection |
-| `RELEASE_FRAMES` | Consecutive open-hand frames before release |
-| `LOST_TOLERANCE` | Frames to tolerate temporary hand-tracking loss |
+| `RELEASE_SECONDS` | Continuous open-hand duration before release (default 0.10 seconds) |
+| `LOST_SECONDS` | Duration to tolerate temporary hand-tracking loss (default 0.30 seconds) |
 
 Adjust these gradually if your lighting, camera angle, or hand size affects recognition.
 
@@ -146,12 +162,22 @@ python -m pip check
 git diff --check
 ```
 
-The tests cover either-hand ownership, opposite-hand resizing, release debounce,
-tracking loss, smoothing history, timestamps, and aspect-ratio fitting. They do
-not verify real webcam recognition or physical hand labels. Before merging, test
-both hands individually, crossing hands, temporary occlusion, resize, release,
-throw, reset, and window resizing on your Mac. Physics uses per-frame steps, so
-throw speed and friction currently vary with tracking frame rate.
+The tests cover either-hand ownership, local grab anchors, rotated collisions and
+wall boundaries, calibration validation, recovery, timestamps, and equal free
+motion at 15, 30, 60, and 120 FPS. Webcam recognition and physical hand labels
+require device testing. Before merging, test both hands individually, crossing
+hands, temporary occlusion, calibration, resize, release, throw, and reset.
+
+Physics uses elapsed seconds with substeps of at most 1/120 second. Velocities
+use pixels/second and degrees/second. Physics advances by at most 0.10 seconds
+after a long stall to avoid large jumps. Rectangle collisions use rotated shapes
+and linear bounce impulses. They do not simulate collision-induced spin or
+continuous collision detection. Very fast objects may still pass through each
+other. At a wall, keeping all corners visible takes priority over the grab anchor.
+
+Hand association uses recent wrist position and movement to resist handedness
+label flicker. Fully overlapping hands or long occlusions can still be ambiguous.
+A recovered hand starts with zero tracked velocity to avoid an accidental throw.
 
 The audited local environment uses Python 3.9.6, MediaPipe 1.1.1,
 OpenCV contrib 5.0.0.93, and NumPy 2.0.2. Only the contrib OpenCV distribution

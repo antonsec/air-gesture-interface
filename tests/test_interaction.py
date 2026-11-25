@@ -2,11 +2,11 @@
 import copy
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 
-from main import CFG, HandData, HandTracker, Object2D, ObjectManipulator, fit_camera_frame
+from main import CFG, HandData, HandTracker, Object2D, ObjectManipulator, PinchCalibration, fit_camera_frame
 
 
 def hand(x=150, gap=0.1, pinching=True):
@@ -18,7 +18,6 @@ class InteractionTests(unittest.TestCase):
         app = ObjectManipulator.__new__(ObjectManipulator)
         app.objects = [Object2D(100, 100, 100, 100, (0, 255, 0), 'test')]
         app._clear_grab()
-        app.offset = (0, 0)
         return app
 
     def test_either_hand_owns_grab_and_other_resizes(self):
@@ -40,13 +39,13 @@ class InteractionTests(unittest.TestCase):
     def test_release_debounce_and_tracking_loss(self):
         app = self.app()
         app.handle_interaction(hand(), None)
-        for _ in range(CFG.RELEASE_FRAMES - 1):
+        for _ in range(round(CFG.RELEASE_SECONDS * CFG.REFERENCE_FPS) - 1):
             app.handle_interaction(hand(pinching=False), None)
             self.assertIsNotNone(app.grabbed_idx)
         app.handle_interaction(hand(pinching=False), None)
         self.assertIsNone(app.grabbed_idx)
         app.handle_interaction(hand(), None)
-        for _ in range(CFG.LOST_TOLERANCE + 1):
+        for _ in range(round(CFG.LOST_SECONDS * CFG.REFERENCE_FPS) + 1):
             app.handle_interaction(None, hand(400))
         self.assertIsNone(app.grabbed_idx)
 
@@ -63,6 +62,10 @@ class TrackerTests(unittest.TestCase):
         tracker = HandTracker.__new__(HandTracker)
         tracker.smooth_state = {}
         tracker.last_timestamp_ms = -1
+        tracker.calibration = PinchCalibration()
+        clock = patch("main.time.monotonic_ns", side_effect=[1_000_000_000 + i * 33_000_000 for i in range(20)])
+        clock.start()
+        self.addCleanup(clock.stop)
         tracker.hands = Mock()
         landmarks = [SimpleNamespace(x=0.5, y=0.5) for _ in range(21)]
         landmarks[5].x, landmarks[17].x = 0.4, 0.6
@@ -79,7 +82,7 @@ class TrackerTests(unittest.TestCase):
         result.hand_landmarks = [moved]
         second, _ = tracker.process(frame)
         self.assertAlmostEqual(tracker.smooth_state['Right']['prev'][0], moved[8].x * 960)
-        self.assertAlmostEqual(second.velocity[0], second.pinch_point[0] - first.pinch_point[0])
+        self.assertAlmostEqual(second.velocity[0], (second.pinch_point[0] - first.pinch_point[0]) / 0.033)
         # A fresh hand with a 0.35-palm gap must stay open; the old
         # 0.48 threshold classified this clearly separated pose as a pinch.
         tracker.smooth_state.clear()
@@ -91,9 +94,18 @@ class TrackerTests(unittest.TestCase):
         self.assertFalse(open_hand.is_pinching)
         self.assertEqual(tracker.hands.detect_for_video.call_args.args[0].width, CFG.TRACKING_WIDTH)
         # Keep the other hand visible while the original disappears.
+        other_landmarks = copy.deepcopy(landmarks)
+        for point in other_landmarks:
+            point.x += 0.4
+        result.hand_landmarks = [other_landmarks]
         result.handedness = [[SimpleNamespace(category_name='Right')]]
         tracker.process(frame)
-        self.assertNotIn('Right', tracker.smooth_state)
+        self.assertFalse(tracker.smooth_state["Right"]["visible"])
+        result.hand_landmarks = [landmarks]
+        result.handedness = [[SimpleNamespace(category_name="Left")]]
+        returned, _ = tracker.process(frame)
+        self.assertTrue(returned.reacquired)
+        self.assertEqual(returned.velocity, (0, 0))
         timestamps = [call.args[1] for call in tracker.hands.detect_for_video.call_args_list]
         self.assertTrue(all(a < b for a, b in zip(timestamps, timestamps[1:])))
 
